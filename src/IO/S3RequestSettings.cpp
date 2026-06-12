@@ -52,6 +52,7 @@ namespace ErrorCodes
     DECLARE(Bool, allow_multipart_copy, true, "", 0) \
     DECLARE(UInt64, max_single_operation_copy_size, S3::DEFAULT_MAX_SINGLE_OPERATION_COPY_SIZE, "", 0) \
     DECLARE(String, storage_class_name, "", "", 0) \
+    DECLARE(String, upload_checksum_algorithm, "", "", 0) \
     DECLARE(UInt64, http_max_fields, 1000000, "", 0) \
     DECLARE(UInt64, http_max_field_name_size, 128 * 1024, "", 0) \
     DECLARE(UInt64, http_max_field_value_size, 128 * 1024, "", 0) \
@@ -274,6 +275,13 @@ void S3RequestSettings::validateUploadSettings()
             "Setting storage_class has invalid value {} which only supports STANDARD and INTELLIGENT_TIERING",
             impl->storage_class_name.value);
 
+    std::unordered_set<String> upload_checksum_algorithms {"CRC32", "SHA256"};
+    if (!impl->upload_checksum_algorithm.value.empty() && !upload_checksum_algorithms.contains(impl->upload_checksum_algorithm))
+        throw Exception(
+            ErrorCodes::INVALID_SETTING_VALUE,
+            "Setting upload_checksum_algorithm has invalid value {} which only supports CRC32 and SHA256",
+            impl->upload_checksum_algorithm.value);
+
     /// TODO: it's possible to set too small limits.
     /// We can check that max possible object size is not too small.
 }
@@ -333,6 +341,9 @@ void S3RequestSettings::normalizeSettings()
 {
     if (!impl->storage_class_name.value.empty() && impl->storage_class_name.changed)
         impl->storage_class_name = Poco::toUpperInPlace(impl->storage_class_name.value);
+
+    if (!impl->upload_checksum_algorithm.value.empty() && impl->upload_checksum_algorithm.changed)
+        impl->upload_checksum_algorithm = Poco::toUpperInPlace(impl->upload_checksum_algorithm.value);
 }
 
 void S3RequestSettings::serialize(WriteBuffer & out, ContextPtr) const

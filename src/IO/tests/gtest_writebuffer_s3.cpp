@@ -47,6 +47,7 @@ namespace Setting
     extern const SettingsUInt64 s3_max_upload_part_size;
     extern const SettingsUInt64 s3_min_upload_part_size;
     extern const SettingsUInt64 s3_strict_upload_part_size;
+    extern const SettingsString s3_upload_checksum_algorithm;
     extern const SettingsUInt64 s3_upload_part_size_multiply_factor;
     extern const SettingsUInt64 s3_upload_part_size_multiply_parts_count_threshold;
 }
@@ -460,6 +461,47 @@ struct UploadPartFailIngection: InjectionModel
     }
 };
 
+struct ChecksumRecordingInjection : InjectionModel
+{
+    std::optional<Aws::S3::Model::PutObjectOutcome> call(const Aws::S3::Model::PutObjectRequest & request) override
+    {
+        put_object_algorithm = request.GetChecksumAlgorithm();
+        return std::nullopt;
+    }
+
+    std::optional<Aws::S3::Model::CreateMultipartUploadOutcome> call(const Aws::S3::Model::CreateMultipartUploadRequest & request) override
+    {
+        create_multipart_upload_algorithm = request.GetChecksumAlgorithm();
+        return std::nullopt;
+    }
+
+    std::optional<Aws::S3::Model::UploadPartOutcome> call(const Aws::S3::Model::UploadPartRequest & request) override
+    {
+        upload_part_algorithms.push_back(request.GetChecksumAlgorithm());
+        upload_part_crc32_checksums.push_back(request.GetChecksumCRC32());
+        upload_part_sha256_checksums.push_back(request.GetChecksumSHA256());
+        return std::nullopt;
+    }
+
+    std::optional<Aws::S3::Model::CompleteMultipartUploadOutcome> call(const Aws::S3::Model::CompleteMultipartUploadRequest & request) override
+    {
+        for (const auto & part : request.GetMultipartUpload().GetParts())
+        {
+            complete_part_crc32_checksums.push_back(part.GetChecksumCRC32());
+            complete_part_sha256_checksums.push_back(part.GetChecksumSHA256());
+        }
+        return std::nullopt;
+    }
+
+    Aws::S3::Model::ChecksumAlgorithm put_object_algorithm = Aws::S3::Model::ChecksumAlgorithm::NOT_SET;
+    Aws::S3::Model::ChecksumAlgorithm create_multipart_upload_algorithm = Aws::S3::Model::ChecksumAlgorithm::NOT_SET;
+    std::vector<Aws::S3::Model::ChecksumAlgorithm> upload_part_algorithms;
+    std::vector<String> upload_part_crc32_checksums;
+    std::vector<String> upload_part_sha256_checksums;
+    std::vector<String> complete_part_crc32_checksums;
+    std::vector<String> complete_part_sha256_checksums;
+};
+
 struct BaseSyncPolicy
 {
     virtual ~BaseSyncPolicy() = default;
@@ -807,6 +849,82 @@ TEST_P(SyncAsync, ExceptionOnCreateMPU) {
             throw;
         }
       }, DB::S3Exception);
+}
+
+TEST_P(SyncAsync, UploadChecksumAlgorithmSHA256Singlepart)
+{
+    auto injection = std::make_shared<MockS3::ChecksumRecordingInjection>();
+    setInjectionModel(injection);
+
+    getSettings()[Setting::s3_upload_checksum_algorithm] = "SHA256";
+
+    auto buffer = getWriteBuffer("checksum_sha256_singlepart");
+    writeAsOneBlock(*buffer, 10);
+
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->finalize();
+
+    ASSERT_EQ(Aws::S3::Model::ChecksumAlgorithm::SHA256, injection->put_object_algorithm);
+}
+
+TEST_P(SyncAsync, UploadChecksumAlgorithmSHA256Multipart)
+{
+    auto injection = std::make_shared<MockS3::ChecksumRecordingInjection>();
+    setInjectionModel(injection);
+
+    getSettings()[Setting::s3_upload_checksum_algorithm] = "SHA256";
+    getSettings()[Setting::s3_max_single_part_upload_size] = 0;
+    getSettings()[Setting::s3_min_upload_part_size] = 1;
+
+    auto buffer = getWriteBuffer("checksum_sha256_multipart");
+    writeAsOneBlock(*buffer, 10);
+
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->finalize();
+
+    ASSERT_EQ(Aws::S3::Model::ChecksumAlgorithm::SHA256, injection->create_multipart_upload_algorithm);
+    ASSERT_THAT(injection->upload_part_algorithms, testing::Not(testing::IsEmpty()));
+    ASSERT_THAT(injection->upload_part_algorithms, testing::Each(Aws::S3::Model::ChecksumAlgorithm::SHA256));
+    ASSERT_EQ(injection->upload_part_sha256_checksums, injection->complete_part_sha256_checksums);
+    ASSERT_THAT(injection->complete_part_sha256_checksums, testing::Each(testing::Not(testing::IsEmpty())));
+}
+
+TEST_P(SyncAsync, UploadChecksumAlgorithmCRC32Singlepart)
+{
+    auto injection = std::make_shared<MockS3::ChecksumRecordingInjection>();
+    setInjectionModel(injection);
+
+    getSettings()[Setting::s3_upload_checksum_algorithm] = "CRC32";
+
+    auto buffer = getWriteBuffer("checksum_crc32_singlepart");
+    writeAsOneBlock(*buffer, 10);
+
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->finalize();
+
+    ASSERT_EQ(Aws::S3::Model::ChecksumAlgorithm::CRC32, injection->put_object_algorithm);
+}
+
+TEST_P(SyncAsync, UploadChecksumAlgorithmCRC32Multipart)
+{
+    auto injection = std::make_shared<MockS3::ChecksumRecordingInjection>();
+    setInjectionModel(injection);
+
+    getSettings()[Setting::s3_upload_checksum_algorithm] = "CRC32";
+    getSettings()[Setting::s3_max_single_part_upload_size] = 0;
+    getSettings()[Setting::s3_min_upload_part_size] = 1;
+
+    auto buffer = getWriteBuffer("checksum_crc32_multipart");
+    writeAsOneBlock(*buffer, 10);
+
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->finalize();
+
+    ASSERT_EQ(Aws::S3::Model::ChecksumAlgorithm::CRC32, injection->create_multipart_upload_algorithm);
+    ASSERT_THAT(injection->upload_part_algorithms, testing::Not(testing::IsEmpty()));
+    ASSERT_THAT(injection->upload_part_algorithms, testing::Each(Aws::S3::Model::ChecksumAlgorithm::CRC32));
+    ASSERT_EQ(injection->upload_part_crc32_checksums, injection->complete_part_crc32_checksums);
+    ASSERT_THAT(injection->complete_part_crc32_checksums, testing::Each(testing::Not(testing::IsEmpty())));
 }
 
 
